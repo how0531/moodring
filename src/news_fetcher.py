@@ -72,7 +72,7 @@ RECESSION_KEYWORDS = [
     "soft landing", "軟著陸", "hard landing", "硬著陸",
 ]
 
-# Bullish signals
+# Bullish signals (US / generic English + zh-CN macro). Used for global / US market.
 BULLISH_KEYWORDS = [
     "surge", "rally", "gain", "rise", "soar", "jump", "beat", "exceed",
     "record high", "breakout", "upgrade", "buy", "bullish", "optimism",
@@ -80,13 +80,66 @@ BULLISH_KEYWORDS = [
     "recovery", "rebound", "bounce", "positive", "upbeat",
 ]
 
-# Bearish signals
+# Bearish signals (US / generic English + zh-CN macro).
 BEARISH_KEYWORDS = [
     "crash", "plunge", "fall", "drop", "tumble", "sink", "miss", "below",
     "downgrade", "sell", "bearish", "pessimism", "fear", "panic",
     "下跌", "暴跌", "崩盤", "賣出", "悲觀", "恐慌", "疲弱", "差於預期",
     "warning", "risk", "concern", "worry", "threat", "危機", "風險",
 ]
+
+# ── TW-specific keyword lexicons (繁體中文) ──────────────────────────────────
+# Weighted: STRONG terms count as 2, WEAK as 1, so aggregate sentiment
+# reflects intensity rather than just direction. Used when market == "tw".
+TW_BULLISH_STRONG = [
+    "大漲", "暴漲", "飆漲", "飆升", "創新高", "創高", "突破高點",
+    "強漲", "噴出", "漲停", "強彈", "多頭", "全面上漲", "拉抬",
+    "全面收紅", "齊揚", "創歷史新高", "領漲",
+]
+TW_BULLISH_WEAK = [
+    "上漲", "反彈", "回升", "走高", "走升", "看好", "樂觀",
+    "利多", "買盤", "加碼", "翻紅", "上攻", "穩步上揚", "止跌",
+    "外資買超", "三大法人買超", "資金流入",
+]
+TW_BEARISH_STRONG = [
+    "大跌", "重挫", "崩跌", "崩盤", "暴跌", "跌停", "殺盤", "套牢",
+    "慘跌", "失守", "跌破", "雪崩", "全面下跌", "賣壓沉重", "恐慌",
+    "全面收黑", "齊跌", "創新低", "領跌",
+]
+TW_BEARISH_WEAK = [
+    "下跌", "回檔", "拉回", "走低", "看壞", "悲觀", "利空", "賣盤",
+    "減碼", "翻黑", "下殺", "疲弱", "走疲", "壓回", "外資賣超",
+    "三大法人賣超", "資金流出",
+]
+
+# US / generic weighted lists — derived from the existing flat lists so the
+# new scorer has a "strong" tier even for English news.
+US_BULLISH_STRONG = [
+    "surge", "soar", "skyrocket", "rally", "breakout", "record high",
+    "all-time high", "blowout", "beat estimates",
+]
+US_BULLISH_WEAK = [
+    "gain", "rise", "jump", "beat", "exceed", "upgrade", "buy", "bullish",
+    "optimism", "recovery", "rebound", "bounce", "positive", "upbeat",
+    "上漲", "大漲", "突破", "創高", "買進", "樂觀", "強勁", "好於預期",
+]
+US_BEARISH_STRONG = [
+    "crash", "plunge", "collapse", "tumble", "rout", "meltdown",
+    "selloff", "panic", "崩盤", "暴跌", "恐慌",
+]
+US_BEARISH_WEAK = [
+    "fall", "drop", "sink", "miss", "below", "downgrade", "sell", "bearish",
+    "pessimism", "fear", "warning", "risk", "concern", "worry", "threat",
+    "下跌", "賣出", "悲觀", "疲弱", "差於預期", "危機", "風險",
+]
+
+# Negation markers — when one appears within a small window BEFORE a bull/bear
+# keyword, the keyword's contribution is flipped.
+NEGATION_MARKERS = [
+    "不", "沒", "未", "無", "非", "並未", "並無", "沒有", "不會", "不再", "難以",
+    "not ", "no ", "n't ", "without ", "never ", "hardly ", "scarcely ",
+]
+NEGATION_WINDOW = 6  # chars (works for both ASCII and CJK)
 
 # High-relevance equity/options terms (boost score)
 EQUITY_KEYWORDS = [
@@ -123,14 +176,80 @@ def compute_relevance_score(text: str) -> int:
     return min(max(score, 1), 10)
 
 
-def compute_sentiment(text: str) -> str:
+def _has_negation_before(t: str, kw_start: int) -> bool:
+    """Return True if any NEGATION_MARKERS occurs in the NEGATION_WINDOW
+    characters immediately before kw_start. Operates on lowercased text."""
+    lo = max(0, kw_start - NEGATION_WINDOW)
+    window = t[lo:kw_start]
+    return any(m in window for m in NEGATION_MARKERS)
+
+
+def _weighted_hits(t: str, strong_kws: list, weak_kws: list) -> tuple:
+    """Return (plain_total, negated_total) of weighted keyword hits.
+
+    STRONG keywords contribute 2.0 each; WEAK 1.0. A negation marker within
+    NEGATION_WINDOW chars before the keyword routes that hit to the negated
+    bucket (caller treats it as contributing to the opposite polarity)."""
+    plain = 0.0
+    negated = 0.0
+    for kw, w in [(k, 2.0) for k in strong_kws] + [(k, 1.0) for k in weak_kws]:
+        idx = 0
+        while True:
+            pos = t.find(kw, idx)
+            if pos == -1:
+                break
+            if _has_negation_before(t, pos):
+                negated += w
+            else:
+                plain += w
+            idx = pos + len(kw)
+    return plain, negated
+
+
+def compute_sentiment_score(text: str, market: str = "us") -> float:
+    """Return a continuous sentiment score in [-1, 1] for the given text.
+
+    Positive = bullish (greedy), negative = bearish (fearful). The score is
+    normalised so volume alone doesn't dominate:
+        score = (bull - bear) / (bull + bear)
+
+    Negated terms are routed to the opposite polarity bucket — e.g. "未上漲"
+    (did not rise) contributes to the bear bucket, not the bull bucket.
+
+    `market` selects the keyword lexicon. "tw" uses the Traditional Chinese
+    weighted lexicons (with English/zh-CN macro terms at half weight);
+    anything else falls back to US/generic English.
+    """
     t = text.lower()
-    bull = sum(1 for kw in BULLISH_KEYWORDS if kw in t)
-    bear = sum(1 for kw in BEARISH_KEYWORDS if kw in t)
-    if bear > bull:
-        return "bearish"
-    elif bull > bear:
+    if market == "tw":
+        bull_plain, bull_neg = _weighted_hits(t, TW_BULLISH_STRONG, TW_BULLISH_WEAK)
+        bear_plain, bear_neg = _weighted_hits(t, TW_BEARISH_STRONG, TW_BEARISH_WEAK)
+        # Generic macro terms at half weight — TW headlines often borrow them
+        # ("Fed 升息打擊台股") and we don't want to miss the polarity.
+        us_bull_plain, us_bull_neg = _weighted_hits(t, US_BULLISH_STRONG, US_BULLISH_WEAK)
+        us_bear_plain, us_bear_neg = _weighted_hits(t, US_BEARISH_STRONG, US_BEARISH_WEAK)
+        bull_plain += 0.5 * us_bull_plain; bull_neg += 0.5 * us_bull_neg
+        bear_plain += 0.5 * us_bear_plain; bear_neg += 0.5 * us_bear_neg
+    else:
+        bull_plain, bull_neg = _weighted_hits(t, US_BULLISH_STRONG, US_BULLISH_WEAK)
+        bear_plain, bear_neg = _weighted_hits(t, US_BEARISH_STRONG, US_BEARISH_WEAK)
+
+    # Negated bull terms count as bearish; negated bear terms count as bullish.
+    bull = bull_plain + bear_neg
+    bear = bear_plain + bull_neg
+    denom = bull + bear
+    if denom < 1e-9:
+        return 0.0
+    return float(max(-1.0, min(1.0, (bull - bear) / denom)))
+
+
+def compute_sentiment(text: str, market: str = "us") -> str:
+    """Categorical wrapper kept for backward compatibility with existing code."""
+    s = compute_sentiment_score(text, market=market)
+    if s > 0.2:
         return "bullish"
+    if s < -0.2:
+        return "bearish"
     return "neutral"
 
 
@@ -204,20 +323,35 @@ def compute_category(text: str) -> str:
     return best
 
 
+# Maps a news source to the market its headlines primarily concern.
+SOURCE_MARKET = {
+    "yahoo": "us",
+    "cnbc": "us",
+    "jin10": "global",
+    "anue": "tw",
+    "cna": "tw",
+}
+
+
 def _build_item(
     time_str: str,
     source: str,
     headline: str,
     description: str = "",
+    market: Optional[str] = None,
 ) -> dict:
     text = headline + " " + description
-    sentiment = compute_sentiment(text)
+    mkt = market or SOURCE_MARKET.get(source, "us")
+    score = compute_sentiment_score(text, market=mkt)
+    sentiment = "bullish" if score > 0.2 else ("bearish" if score < -0.2 else "neutral")
     return {
         "time": time_str,
         "source": source,
+        "market": mkt,
         "headline": headline,
         "relevance_score": compute_relevance_score(text),
         "sentiment": sentiment,
+        "sentiment_score": round(score, 3),
         "impact": compute_impact(text, sentiment),
         "related_hypotheses": compute_hypotheses(text),
         "category": compute_category(text),
@@ -387,6 +521,78 @@ def _fetch_jin10() -> list:
 
 
 # ---------------------------------------------------------------------------
+# Source: Anue 鉅亨網 (TW)
+# ---------------------------------------------------------------------------
+
+def _fetch_anue() -> list:
+    """Fetch Taiwan equity headlines from Anue (鉅亨網) RSS."""
+    try:
+        import feedparser  # type: ignore
+    except ImportError:
+        logger.warning("feedparser not installed; skipping Anue")
+        return []
+
+    # Anue exposes per-category RSS feeds. tw_stock = 台股, headline = 焦點新聞.
+    urls = [
+        "https://news.cnyes.com/rss/cat/tw_stock",
+        "https://news.cnyes.com/rss/cat/headline",
+    ]
+    items: list = []
+    for url in urls:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:25]:
+                headline = entry.get("title", "").strip()
+                description = entry.get("summary", "")
+                if not headline:
+                    continue
+                published = entry.get("published_parsed")
+                if published:
+                    ts = datetime(*published[:6], tzinfo=timezone.utc)
+                    time_str = ts.strftime("%Y-%m-%dT%H:%M:%S")
+                else:
+                    time_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                items.append(_build_item(time_str, "anue", headline, description, market="tw"))
+        except Exception as e:
+            logger.warning(f"Anue fetch failed for {url}: {e}")
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Source: CNA 中央社 (TW)
+# ---------------------------------------------------------------------------
+
+def _fetch_cna() -> list:
+    """Fetch Taiwan financial headlines from CNA (中央社) RSS."""
+    try:
+        import feedparser  # type: ignore
+    except ImportError:
+        logger.warning("feedparser not installed; skipping CNA")
+        return []
+
+    url = "https://feeds.feedburner.com/rsscna/finance"
+    try:
+        feed = feedparser.parse(url)
+        items = []
+        for entry in feed.entries[:30]:
+            headline = entry.get("title", "").strip()
+            description = entry.get("summary", "")
+            if not headline:
+                continue
+            published = entry.get("published_parsed")
+            if published:
+                ts = datetime(*published[:6], tzinfo=timezone.utc)
+                time_str = ts.strftime("%Y-%m-%dT%H:%M:%S")
+            else:
+                time_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            items.append(_build_item(time_str, "cna", headline, description, market="tw"))
+        return items
+    except Exception as e:
+        logger.warning(f"CNA fetch failed: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Summary computation
 # ---------------------------------------------------------------------------
 
@@ -412,6 +618,15 @@ def _compute_top_theme(items: list) -> str:
     return mapping.get(top, "一般市場動態")
 
 
+def _aggregate_sentiment(items: list) -> float:
+    """Relevance-weighted mean sentiment_score over items. Returns 0 if empty."""
+    if not items:
+        return 0.0
+    num = sum(i.get("sentiment_score", 0.0) * max(i.get("relevance_score", 1), 1) for i in items)
+    den = sum(max(i.get("relevance_score", 1), 1) for i in items)
+    return round(num / den, 3) if den else 0.0
+
+
 def _build_summary(items: list) -> dict:
     bullish = sum(1 for i in items if i["sentiment"] == "bullish")
     bearish = sum(1 for i in items if i["sentiment"] == "bearish")
@@ -420,6 +635,19 @@ def _build_summary(items: list) -> dict:
         if items
         else 0.0
     )
+    # Per-market aggregate sentiment so the score blender can pick the right
+    # input for US vs TW dashboards. "global" covers Jin10-style macro items.
+    by_market: dict = {}
+    for mkt in ("us", "tw", "global"):
+        mkt_items = [i for i in items if i.get("market") == mkt]
+        by_market[mkt] = {
+            "sentiment": _aggregate_sentiment(mkt_items),
+            "n_items": len(mkt_items),
+            "avg_relevance": (
+                round(sum(i["relevance_score"] for i in mkt_items) / len(mkt_items), 1)
+                if mkt_items else 0.0
+            ),
+        }
     return {
         "bullish_count": bullish,
         "bearish_count": bearish,
@@ -427,6 +655,8 @@ def _build_summary(items: list) -> dict:
         "total_items": len(items),
         "avg_relevance": avg_rel,
         "top_theme": _compute_top_theme(items),
+        "by_market": by_market,
+        "overall_sentiment": _aggregate_sentiment(items),
     }
 
 
@@ -435,19 +665,20 @@ def _build_summary(items: list) -> dict:
 # ---------------------------------------------------------------------------
 
 def fetch_news() -> dict:
-    """
-    Fetch news from Jin10, Yahoo Finance, and CNBC.
-    Returns structured dict with items, summary, and updated_at.
-    """
+    """Fetch news from all sources (US + TW + global) and aggregate."""
     all_items = []
 
     jin10_items = _fetch_jin10()
     yahoo_items = _fetch_yahoo()
     cnbc_items = _fetch_cnbc()
+    anue_items = _fetch_anue()
+    cna_items = _fetch_cna()
 
     all_items.extend(jin10_items)
     all_items.extend(yahoo_items)
     all_items.extend(cnbc_items)
+    all_items.extend(anue_items)
+    all_items.extend(cna_items)
 
     # Sort by relevance descending, then by time descending
     all_items.sort(key=lambda x: (-x["relevance_score"], x["time"]), reverse=False)
@@ -470,6 +701,8 @@ def fetch_news() -> dict:
                 "jin10": len(jin10_items),
                 "yahoo": len(yahoo_items),
                 "cnbc": len(cnbc_items),
+                "anue": len(anue_items),
+                "cna": len(cna_items),
             },
             "updated_at": updated_at,
         }

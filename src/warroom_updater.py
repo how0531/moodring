@@ -16,6 +16,7 @@ import yfinance as yf
 
 from macro_data_fetcher import fetch_macro_data
 from news_fetcher import fetch_news
+from news_history import record_news
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -620,6 +621,12 @@ def build_output(existing: dict[str, Any]) -> dict[str, Any]:
     news_data: dict[str, Any] = {}
     try:
         news_data = fetch_news()
+        # Persist today's aggregate sentiment so compute_score can read it.
+        # Failure to record must never break the warroom build.
+        try:
+            record_news(news_data)
+        except Exception as e:
+            print(f"Warning: news_history.record_news failed: {e}")
     except Exception as e:
         print(f"Warning: news fetch failed: {e}")
 
